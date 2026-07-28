@@ -1,0 +1,75 @@
+{
+  "cached_at": 1784684596.085726,
+  "moments": [
+    {
+      "start": "29:25",
+      "end": "30:07",
+      "dialogue": "तुम मुनिसिपल कॉरपोरेशन ऑफ दिल्ली गए और तुम्हारी फाइल बाबू के सामने रखी है और बाबू तुम्हारी फाइल देख नहीं रहा है।",
+      "hook_type": "pattern_interrupt",
+      "structure_check": "The Hook asks how Newton's First Law applies in real life, the Build humorously describes bribing an MCD clerk to move a file, and the Payoff connects the stationary clerk to a body at rest requiring an external force.",
+      "standalone_clarity": 9,
+      "hook_strength": 8,
+      "emotional_intensity": 7,
+      "quotability": 9,
+      "start_sec": 1765.44,
+      "end_sec": 1807.2,
+      "virality_score": 82
+    },
+    {
+      "start": "47:45",
+      "end": "48:21",
+      "dialogue": "लड़की हंसी तो पटी... लड़की हंसती इसीलिए है कि अब तेरी बारी।",
+      "hook_type": "controversial_claim",
+      "structure_check": "The Hook challenges the common myth that a girl laughing means she likes you, the Build cites comedic dating hazards, and the Payoff humorously warns that her laughter means you are her next target.",
+      "standalone_clarity": 9,
+      "hook_strength": 9,
+      "emotional_intensity": 8,
+      "quotability": 9,
+      "start_sec": 2865.68,
+      "end_sec": 2901.2,
+      "virality_score": 88
+    },
+    {
+      "start": "57:05",
+      "end": "57:45",
+      "dialogue": "20 साल का लड़का उत्तेजना में होता है तो शीघ्र पतन उसे होगा... और 40 साल वाले के पास 13 ईएमआई है... उसको ईडी होगा।",
+      "hook_type": "controversial_claim",
+      "structure_check": "The Hook claims sexual health problems in men are purely psychological, the Build contrasts youthful overexcitement with adult financial worries, and the Payoff delivers the punchline that 13 EMIs cause erectile dysfunction.",
+      "standalone_clarity": 8,
+      "hook_strength": 9,
+      "emotional_intensity": 8,
+      "quotability": 8,
+      "start_sec": 3425.2,
+      "end_sec": 3464.32,
+      "virality_score": 84
+    },
+    {
+      "start": "77:47",
+      "end": "78:25",
+      "dialogue": "दुर्योधन को समझाने को भीषण विध्वंस बचाने को भगवान हस्तिनापुर आए... जब नाश मनुष्य पे छाता है पहले विवेक मर जाता है।",
+      "hook_type": "emotional_peak",
+      "structure_check": "The Hook introduces Ramdhari Singh Dinkar's iconic poetry, the Build recites Krishna's failed peace mission to Duryodhana, and the Payoff delivers the immortal quote that wisdom dies before destruction.",
+      "standalone_clarity": 9,
+      "hook_strength": 8,
+      "emotional_intensity": 9,
+      "quotability": 10,
+      "start_sec": 4667.68,
+      "end_sec": 4704.96,
+      "virality_score": 88
+    },
+    {
+      "start": "84:40",
+      "end": "85:25",
+      "dialogue": "उसने एटीएम में काम कर लिया और वो भी नाइट शिफ्ट में... रात भर एसी में बैठ के पढ़ रहा है... आईआरएस हो गया।",
+      "hook_type": "story_climax",
+      "structure_check": "The Hook asks what single habit lifts a poor student out of poverty, the Build recounts an aspirant taking a night-shift ATM job to study in free air conditioning, and the Payoff reveals he cleared the UPSC IRS exam.",
+      "standalone_clarity": 10,
+      "hook_strength": 8,
+      "emotional_intensity": 9,
+      "quotability": 9,
+      "start_sec": 5079.68,
+      "end_sec": 5124.24,
+      "virality_score": 90
+    }
+  ]
+}
