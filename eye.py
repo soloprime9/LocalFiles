@@ -13,7 +13,7 @@ app = Flask(__name__)
 # Default path for local cookie storage in workspace
 DEFAULT_WORKSPACE_COOKIE_PATH = os.path.join(os.getcwd(), "cookies.txt")
 
-def parse_pasted_cookies(cookie_text, url=None):
+def parse_pasted_cookies(cookie_text):
     """
     Parses various cookie formats (Netscape, JSON, or standard Cookie header string)
     and returns a clean Netscape-format string.
@@ -53,130 +53,144 @@ def parse_pasted_cookies(cookie_text, url=None):
     except Exception:
         pass
 
-    # Determine fallback domain dynamically based on URL if possible
-    domain_to_use = ".hotstar.com"
-    if url:
-        from urllib.parse import urlparse
-        try:
-            parsed = urlparse(url)
-            netloc = parsed.netloc
-            if ":" in netloc:
-                netloc = netloc.split(":")[0]
-            if netloc:
-                if not netloc.startswith(".") and not netloc.replace(".", "").isdigit():
-                    domain_to_use = "." + netloc
-                else:
-                    domain_to_use = netloc
-        except Exception:
-            pass
-
     # Case 3: Key-Value / Cookie Header Format (e.g. "name1=value1; name2=value2")
     # Clean standard Header label if present
     if cookie_text.lower().startswith("cookie:"):
         cookie_text = cookie_text[7:].strip()
     
     parts = cookie_text.split(";")
-    netscape_lines = ["# Netscape HTTP Cookie File", "# Generated from Cookie Header"]
+    netscape_lines = ["# Netscape HTTP Cookie File", "# Generated from Cookie Header", ".hotstar.com\tTRUE\t/\tTRUE\t2082758400"]
     has_cookies = False
     for part in parts:
         if "=" in part:
-            parts_split = part.strip().split("=", 1)
-            if len(parts_split) == 2:
-                name, value = parts_split
-                netscape_lines.append(f"{domain_to_use}\tTRUE\t/\tTRUE\t2082758400\t{name}\t{value}")
-                has_cookies = True
+            name, value = part.strip().split("=", 1)
+            netscape_lines.append(f".hotstar.com\tTRUE\t/\tTRUE\t2082758400\t{name}\t{value}")
+            has_cookies = True
             
     if has_cookies:
         return "\n".join(netscape_lines)
 
     return ""
 
-
-def sniff_webpage_streams(url, timeout_sec=20):
+def extract_cookies_with_playwright(url, headless=True):
     """
-    Simulates LJ Downloader's background network sniffer.
-    Launches a headless browser session to load the page, intercepts all outgoing
-    network requests, and harvests active stream manifests (.m3u8, .mpd) with their associated HTTP headers.
+    Spins up a browser session using Playwright to visit the target URL,
+    stealthily extracts session cookies and intercepts network traffic for streaming manifests.
+    Supports headless and interactive (non-headless) login sessions.
     """
-    captured_streams = []
-    
-    # Attempt Playwright dynamic sniffing
     try:
         from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError(
+            "Playwright package is not installed.\n"
+            "To use automated browser extraction, make sure to install it in your environment:\n"
+            "  pip install playwright\n"
+            "  playwright install chromium"
+        )
+
+    mode_str = "headless" if headless else "INTERACTIVE POPUP (non-headless)"
+    print(f"[PLAYWRIGHT] Launching browser ({mode_str}) to retrieve session cookies and sniff streams for: {url}")
+    
+    sniffed_streams = []
+
+    try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ]
-            )
+            try:
+                browser = p.chromium.launch(
+                    headless=headless,
+                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+                )
+            except Exception as launch_err:
+                raise RuntimeError(
+                    f"Failed to launch Chromium browser: {str(launch_err)}\n"
+                    "This usually means chromium system libraries are missing in this environment.\n"
+                    "Please install them using:\n"
+                    "  playwright install chromium"
+                )
+
+            # Mask browser footprint with user agent
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 720}
             )
             page = context.new_page()
             
-            # Request event handler
-            def on_request(request):
-                req_url = request.url
-                # Search for .m3u8 or .mpd
-                if any(ext in req_url.lower() for ext in [".m3u8", ".mpd", "playlist", "master.m3u8", "index.m3u8"]):
-                    headers = {}
-                    try:
-                        headers = request.headers
-                    except Exception:
-                        pass
-                    # Exclude duplicates
-                    if not any(item["url"] == req_url for item in captured_streams):
-                        captured_streams.append({
-                            "url": req_url,
-                            "headers": headers,
-                            "type": "HLS (.m3u8)" if ".m3u8" in req_url.lower() else "DASH (.mpd)"
-                        })
+            # Setup network sniffer to capture live streams and their exact headers
+            def handle_request(req):
+                req_url = req.url
+                url_lower = req_url.lower()
+                if ".m3u8" in url_lower or ".mpd" in url_lower or "manifest" in url_lower or "/master" in url_lower or "/playlist" in url_lower:
+                    if not any(x in url_lower for x in ["googletagservices", "google-analytics", "facebook", "segment.io", "hotjar"]):
+                        try:
+                            headers_dict = dict(req.headers)
+                            if not any(s['url'] == req_url for s in sniffed_streams):
+                                stream_type = "HLS (m3u8)" if ".m3u8" in url_lower else "DASH (mpd)"
+                                if "manifest" in url_lower and "dash" in url_lower:
+                                    stream_type = "DASH (mpd)"
+                                sniffed_streams.append({
+                                    "url": req_url,
+                                    "headers": headers_dict,
+                                    "type": stream_type
+                                })
+                                print(f"[SNIFFER] Captured active stream ({stream_type}): {req_url[:80]}...")
+                        except Exception as sniffer_err:
+                            pass
 
-            page.on("request", on_request)
+            page.on("request", handle_request)
+            
+            print(f"[PLAYWRIGHT] Navigating to URL: {url}...")
+            page.goto(url, wait_until="commit", timeout=35000)
+            
+            if not headless:
+                print("[PLAYWRIGHT] INTERACTIVE LOGIN INSTRUCTIONS:")
+                print("1. A browser window has opened on your computer.")
+                print("2. Log into your Hotstar account (or let page load completely).")
+                print("3. Once logged in, either close the browser window or wait 90 seconds.")
+                # Give user plenty of time to log in interactively (up to 90 seconds)
+                for i in range(45):
+                    page.wait_for_timeout(2000)
+                    try:
+                        if page.is_closed():
+                            print("[PLAYWRIGHT] User closed the window. Proceeding to save cookies...")
+                            break
+                    except Exception:
+                        break
+            else:
+                # Headless delay
+                page.wait_for_timeout(8000)
             
             try:
-                page.goto(url, wait_until="commit", timeout=timeout_sec * 1000)
-            except Exception as e:
-                print(f"[SNIFFER] Playwright Navigation Warning (non-blocking): {e}")
+                cookies = context.cookies()
+            except Exception:
+                cookies = []
                 
-            # Wait a few seconds for video player and scripts to dynamically execute and fetch media manifest
-            page.wait_for_timeout(6000)
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
             
+            # Construct Netscape cookie format
+            netscape_lines = ["# Netscape HTTP Cookie File", "# Automatically harvested by Playwright Stealth Engine"]
+            for c in cookies:
+                domain = c.get("domain", "")
+                include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+                path = c.get("path", "/")
+                secure = "TRUE" if c.get("secure", False) else "FALSE"
+                expiry = int(c.get("expires", 2082758400))
+                if expiry < 0:
+                    expiry = 2082758400
+                name = c.get("name", "")
+                value = c.get("value", "")
+                
+                if domain and name:
+                    netscape_lines.append(f"{domain}\t{include_sub}\t{path}\t{secure}\t{expiry}\t{name}\t{value}")
+            
+            print(f"[PLAYWRIGHT] Successfully extracted {len(cookies)} cookies and sniffed {len(sniffed_streams)} stream manifests.")
+            return "\n".join(netscape_lines), sniffed_streams
     except Exception as e:
-        print(f"[SNIFFER] Playwright engine failed or unavailable: {e}")
+        raise RuntimeError(f"Playwright Extraction Error: {str(e)}")
 
-    # Fallback/Supplemental Scraper (Regex and Direct requests)
-    try:
-        import requests
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": url
-        }
-        res = requests.get(url, headers=headers, timeout=12)
-        if res.status_code == 200:
-            html_content = res.text
-            # Look for matches with regex
-            matches = re.findall(r'https?://[^\s"\'`>]+?\.(?:m3u8|mpd)(?:\?[^\s"\'`>]+)?', html_content)
-            for match in matches:
-                if not any(item["url"] == match for item in captured_streams):
-                    captured_streams.append({
-                        "url": match,
-                        "headers": headers,
-                        "type": "HLS (.m3u8)" if ".m3u8" in match.lower() else "DASH (.mpd)"
-                    })
-    except Exception as fallback_err:
-        print(f"[SNIFFER] Fallback regex scraper failed: {fallback_err}")
-        
-    return {"streams": captured_streams}
-
-
-def fetch_platform_metadata(url, cookie_source="file", custom_file_path=None, pasted_cookie_content=None, browser_name="chrome"):
+def fetch_platform_metadata(url, cookie_source="file", custom_file_path=None, pasted_cookie_content=None, browser_name="chrome", playwright_headless=True):
     ydl_opts = {
         'skip_download': True,
         'extract_flat': False,
@@ -203,6 +217,18 @@ def fetch_platform_metadata(url, cookie_source="file", custom_file_path=None, pa
             else:
                 raise ValueError("Could not parse pasted cookies. Ensure they are in Netscape, JSON, or Cookie Header format.")
         
+        elif cookie_source == "playwright_auto":
+            print(f"[INFO] Running automated session orchestration using Playwright on: {url} (headless={playwright_headless})")
+            playwright_cookies, sniffed_streams = extract_cookies_with_playwright(url, headless=playwright_headless)
+            
+            # Save harvested cookies to temporary file
+            fd, temp_path = tempfile.mkstemp(suffix=".txt", prefix="cookies_pw_")
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(playwright_cookies)
+            temp_cookie_file = temp_path
+            ydl_opts['cookiefile'] = temp_cookie_file
+            print(f"[INFO] Using Playwright harvested cookies: {temp_cookie_file}")
+
         elif cookie_source == "browser":
             print(f"[INFO] Loading active cookies directly from browser: {browser_name}")
             ydl_opts['cookiesfrombrowser'] = (browser_name,)
@@ -234,7 +260,7 @@ def fetch_platform_metadata(url, cookie_source="file", custom_file_path=None, pa
                     "Duration_Seconds": info_dict.get('duration'),
                     "Description": info_dict.get('description'),
                     "Thumbnails": [t.get('url') for t in info_dict.get('thumbnails', []) if t.get('url')],
-                    "Sniffed_Streams": []
+                    "Sniffed_Streams": sniffed_streams
                 }
                 
                 subtitles = info_dict.get('subtitles', {})
@@ -256,7 +282,37 @@ def fetch_platform_metadata(url, cookie_source="file", custom_file_path=None, pa
                 structured_data["Available_Formats"] = formats_list
                 return structured_data
         except Exception as ydl_err:
-            raise ydl_err
+            # If yt-dlp fails but we have sniffed streams, let's gracefully return them!
+            if sniffed_streams:
+                print(f"[WARNING] yt-dlp failed but sniffed_streams are available: {str(ydl_err)}")
+                formats_list = []
+                for idx, s in enumerate(sniffed_streams):
+                    formats_list.append({
+                        "Format_ID": f"sniffed-{idx + 1}",
+                        "Resolution": f"Stream {idx + 1} ({s['type']})",
+                        "Video_Codec": "H.264 / AAC",
+                        "Audio_Codec": "Dynamic",
+                        "FPS": None,
+                        "Bitrate_kbps": None,
+                        "Container_Ext": "m3u8" if "m3u8" in s["type"].lower() else "mpd",
+                        "Stream_Manifest_URL": s["url"],
+                        "Headers": s["headers"]
+                    })
+                return {
+                    "Title": "Captured Stream (LJ Downloader Mode)",
+                    "Content_ID": "sniffed_fallback",
+                    "Series_Name": "Automated Network Interceptor",
+                    "Episode_Number": None,
+                    "Release_Date": "Live Captured",
+                    "Duration_Seconds": None,
+                    "Description": "yt-dlp is unable to read metadata directly due to DRM or login walls. However, the Playwright engine successfully intercepted the active web-player media URL and session authorization headers directly from the network pipeline.",
+                    "Thumbnails": [],
+                    "Available_Subtitles": [],
+                    "Available_Formats": formats_list,
+                    "Sniffed_Streams": sniffed_streams
+                }
+            else:
+                raise ydl_err
 
     except Exception as e:
         error_msg = str(e)
@@ -309,7 +365,7 @@ def format_size(bytes_val):
     else:
         return f"{bytes_val / (1024 * 1024):.1f} MB"
 
-def download_task_thread(download_id, target_url, headers=None, format_id=None, cookie_source="none", pasted_cookie_content=None, custom_file_path=None, browser_name="chrome", title=None):
+def download_task_thread(download_id, target_url, headers=None, format_id=None, cookie_source="none", pasted_cookie_content=None, custom_file_path=None, browser_name="chrome"):
     temp_cookie_file = None
     try:
         downloads_status[download_id] = {
@@ -320,37 +376,25 @@ def download_task_thread(download_id, target_url, headers=None, format_id=None, 
             "eta": "Calculating...",
             "filename": "",
             "error": None,
-            "title": title or "Stream Download",
+            "title": "Stream Download",
             "size": "Unknown",
-            "cancelled": False,
-            "fragment_index": 0,
-            "fragment_count": 0
+            "cancelled": False
         }
         
         ydl_opts = {
+            'outtmpl': os.path.join(DOWNLOADS_DIR, '%(title)s-%(id)s.%(ext)s'),
             'nocheckcertificate': True,
             'prefer_insecure': True,
-            'geo_bypass': True,
-            'retries': 10,
-            'fragment_retries': 10,
-            'concurrent_fragment_downloads': 8, # Blazing fast segment-level multi-threading
-            'ignoreerrors': True,
         }
         
-        # Clean custom headers to ensure strictly string keys and values (prevents urllib NoneType errors)
-        clean_headers = {}
-        if headers and isinstance(headers, dict):
-            for k, v in headers.items():
-                if k and v is not None:
-                    clean_headers[str(k)] = str(v)
-        if clean_headers:
-            ydl_opts['http_headers'] = clean_headers
+        if headers:
+            ydl_opts['http_headers'] = headers
             
         if format_id and not format_id.startswith("sniffed-"):
             ydl_opts['format'] = format_id
             
         if cookie_source == "pasted" and pasted_cookie_content:
-            netscape_cookies = parse_pasted_cookies(pasted_cookie_content, url=target_url)
+            netscape_cookies = parse_pasted_cookies(pasted_cookie_content)
             if netscape_cookies:
                 fd, temp_path = tempfile.mkstemp(suffix=".txt", prefix="cookies_dl_")
                 with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -363,38 +407,19 @@ def download_task_thread(download_id, target_url, headers=None, format_id=None, 
                 ydl_opts['cookiefile'] = file_to_use
         elif cookie_source == "browser":
             ydl_opts['cookiesfrombrowser'] = (browser_name,)
-
-        # Safe fallback title based on ID if not provided
-        resolved_title = title or f"Stream_{download_id[:6]}"
-        safe_title = re.sub(r'[\\/*?:"<>|]', "", resolved_title).replace(" ", "_")
-        ydl_opts['outtmpl'] = os.path.join(DOWNLOADS_DIR, f"{safe_title}-%(id)s.%(ext)s")
             
         def hook(d):
             if downloads_status.get(download_id, {}).get("cancelled", False):
                 raise DownloadCancelledException("Download cancelled by user")
                 
-            # Live title updates directly from the running stream's active info_dict
-            if 'info_dict' in d:
-                info_title = d['info_dict'].get('title')
-                if info_title:
-                    downloads_status[download_id]["title"] = info_title
-
             if d['status'] == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
                 downloaded = d.get('downloaded_bytes', 0)
                 
-                fragment_index = d.get('fragment_index')
-                fragment_count = d.get('fragment_count')
-                
                 percentage = 0
-                if fragment_count and fragment_count > 0:
-                    fragment_index = fragment_index or 0
-                    percentage = round((fragment_index / fragment_count) * 100, 1)
-                elif total > 0:
+                if total > 0:
                     percentage = round((downloaded / total) * 100, 1)
-                elif fragment_index is not None:
-                    percentage = -2 # special code for active fragment index with unknown total
-                else:
+                elif d.get('eta') is not None:
                     percentage = -1
                     
                 speed_val = format_speed(d.get('speed'))
@@ -416,9 +441,7 @@ def download_task_thread(download_id, target_url, headers=None, format_id=None, 
                     "speed": speed_val,
                     "eta": eta_val,
                     "size": size_val,
-                    "filename": os.path.basename(d.get('filename', '')),
-                    "fragment_index": fragment_index or 0,
-                    "fragment_count": fragment_count or 0
+                    "filename": os.path.basename(d.get('filename', ''))
                 })
             elif d['status'] == 'finished':
                 downloads_status[download_id].update({
@@ -431,14 +454,15 @@ def download_task_thread(download_id, target_url, headers=None, format_id=None, 
         ydl_opts['progress_hooks'] = [hook]
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(target_url, download=True)
-            if info_dict is None:
-                raise ValueError("Download/Extraction failed. The stream might require authenticating with valid cookies or custom headers, or it is geo-restricted.")
+            try:
+                info = ydl.extract_info(target_url, download=False)
+                title = info.get('title', 'Stream_Video')
+                downloads_status[download_id]["title"] = title
+            except Exception:
+                title = f"Stream_{download_id[:6]}"
+                downloads_status[download_id]["title"] = title
                 
-            # If dynamic title is loaded successfully, save it
-            if 'title' in info_dict and info_dict['title']:
-                downloads_status[download_id]["title"] = info_dict['title']
-
+            info_dict = ydl.extract_info(target_url, download=True)
             filepath = ydl.prepare_filename(info_dict)
             
             actual_filename = os.path.basename(filepath)
@@ -518,7 +542,7 @@ HTML_TEMPLATE = r"""
                 LJ Video Downloader Pro
             </h1>
             <p class="mt-2.5 text-gray-400 text-sm max-w-2xl mx-auto">
-                High-performance segmented stream downloader, custom cookie parser, and parallel chunk merging. Bypasses DRM and logins exactly like a true LJ Downloader.
+                Automatic stream sniffer, cookie bypass manager, and direct segment downloader. Bypasses geo-blocks and logins exactly like LJ Downloader.
             </p>
         </header>
 
@@ -531,39 +555,16 @@ HTML_TEMPLATE = r"""
                 <div class="bg-gray-900 border border-gray-800 rounded-2xl p-6 shadow-xl">
                     <!-- Tab headers -->
                     <div class="flex border-b border-gray-800 mb-5">
-                        <button id="tabLiveBtn" type="button" class="flex-1 pb-3 text-center text-xs sm:text-sm font-semibold text-rose-400 border-b-2 border-rose-500 transition">
-                            Live Interceptor
+                        <button id="tabSnifferBtn" type="button" class="flex-1 pb-3 text-center text-sm font-semibold text-blue-400 border-b-2 border-blue-500 transition">
+                            Hotstar Sniffer
                         </button>
-                        <button id="tabSnifferBtn" type="button" class="flex-1 pb-3 text-center text-xs sm:text-sm font-semibold text-gray-400 border-b-2 border-transparent hover:text-gray-200 transition">
-                            Metadata Fetcher
-                        </button>
-                        <button id="tabDirectBtn" type="button" class="flex-1 pb-3 text-center text-xs sm:text-sm font-semibold text-gray-400 border-b-2 border-transparent hover:text-gray-200 transition">
-                            LJ Direct Mode
+                        <button id="tabDirectBtn" type="button" class="flex-1 pb-3 text-center text-sm font-semibold text-gray-400 border-b-2 border-transparent hover:text-gray-200 transition">
+                            Direct Stream (LJ Mode)
                         </button>
                     </div>
 
-                    <!-- Tab 0 Form (Live Webview Interceptor) -->
-                    <form id="liveSnifferForm" class="space-y-4">
-                        <div>
-                            <label class="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1">Video Webpage URL (to Intercept)</label>
-                            <input type="url" id="liveSniffUrl" required 
-                                   placeholder="https://www.hotstar.com/in/shows/..." 
-                                   class="w-full bg-gray-950 border border-gray-800 rounded-xl px-4 py-3 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-rose-500 transition">
-                        </div>
-
-                        <div class="p-3 bg-rose-950/15 border border-rose-900/30 rounded-xl text-[11px] leading-relaxed text-rose-300">
-                            <strong>Step A: Dynamic Interception Active</strong><br>
-                            This spawns a headless browser instance. It navigates to the page, monitors active network sockets, detects <code>.m3u8</code>/<code>.mpd</code> URLs, and automatically clones session cookies & headers. No manual copying needed!
-                        </div>
-
-                        <button type="submit" id="liveSniffBtn" class="w-full mt-2 bg-gradient-to-r from-rose-600 to-pink-600 hover:from-rose-500 hover:to-pink-500 text-white font-semibold py-3.5 px-4 rounded-xl shadow-lg hover:shadow-rose-500/20 active:scale-[0.98] transition flex items-center justify-center gap-2 text-sm">
-                            <span id="liveSniffBtnText">Start Interception Sniffing</span>
-                            <div id="liveSniffSpinner" class="hidden w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                        </button>
-                    </form>
-
                     <!-- Tab 1 Form (Hotstar Sniffer) -->
-                    <form id="extractForm" class="hidden space-y-4">
+                    <form id="extractForm" class="space-y-4">
                         <!-- Target URL -->
                         <div>
                             <label class="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1">Target Video URL</label>
@@ -577,11 +578,25 @@ HTML_TEMPLATE = r"""
                         <div>
                             <label class="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1">Session Cookie Method</label>
                             <select id="cookieSource" class="w-full bg-gray-950 border border-gray-800 rounded-xl px-4 py-3 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition">
-                                <option value="pasted" selected>Paste Live Cookies / Raw Headers (Recommended)</option>
+                                <option value="playwright_auto">Playwright Automated (Stealth Session Extraction)</option>
+                                <option value="pasted">Paste Live Cookies / Raw Headers (Recommended)</option>
                                 <option value="file">Local Cookies File (cookies.txt)</option>
                                 <option value="browser">Direct Browser Extraction (Local PC Only)</option>
                                 <option value="none">No Cookies (Only works for completely free videos)</option>
                             </select>
+                        </div>
+
+                        <!-- Playwright Mode Selection (Conditional) -->
+                        <div id="playwrightSection" class="bg-gray-950/40 border border-gray-800 rounded-xl p-4 space-y-3">
+                            <div class="flex items-center gap-2">
+                                <input type="checkbox" id="playwrightHeadless" checked class="w-4 h-4 text-blue-600 bg-gray-900 border-gray-700 rounded focus:ring-blue-500 accent-blue-600 cursor-pointer">
+                                <label for="playwrightHeadless" class="text-xs font-semibold text-gray-300 cursor-pointer select-none">
+                                    Headless Mode (Silent Run)
+                                </label>
+                            </div>
+                            <p class="text-[11px] text-gray-500 leading-relaxed">
+                                <strong>Interactive Login Bypass:</strong> If a video requires registration, uncheck this box. When you click Fetch, a browser window will pop up on your computer. Simply complete the OTP/mobile login on Hotstar, then close the window or wait! The script will automatically capture your premium session cookies.
+                            </p>
                         </div>
 
                         <!-- Browser Selection (Conditional) -->
@@ -614,17 +629,9 @@ HTML_TEMPLATE = r"""
                     <!-- Tab 2 Form (Direct Stream / LJ Mode) -->
                     <form id="directStreamForm" class="hidden space-y-4">
                         <div>
-                            <label class="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1">Direct Stream or Video Webpage URL</label>
+                            <label class="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1">Direct Stream URL (.m3u8 / .mpd)</label>
                             <input type="url" id="directStreamUrl" required 
-                                   placeholder="e.g., https://www.youtube.com/watch?v=... OR .m3u8 / .mpd link" 
-                                   class="w-full bg-gray-950 border border-gray-800 rounded-xl px-4 py-3 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-emerald-500 transition">
-                        </div>
-
-                        <div>
-                            <label class="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1">Custom Task / Video Title</label>
-                            <input type="text" id="directTitle" 
-                                   placeholder="Custom_LJ_Download" 
-                                   value="Custom_LJ_Download"
+                                   placeholder="https://.../master.m3u8" 
                                    class="w-full bg-gray-950 border border-gray-800 rounded-xl px-4 py-3 text-sm text-gray-100 placeholder-gray-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 transition">
                         </div>
 
@@ -701,29 +708,6 @@ HTML_TEMPLATE = r"""
                         <!-- Empty State -->
                         <div id="transfersEmptyState" class="text-center py-8 text-gray-500 text-xs">
                             No active or completed downloads. Select a stream format or paste a direct URL to begin!
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Sniffed Intercepted Streams Panel -->
-                <div id="sniffedResultPanel" class="hidden space-y-6">
-                    <div class="bg-gray-900 border border-gray-800 rounded-2xl p-6 shadow-xl">
-                        <div class="flex items-center gap-2 mb-4 border-b border-gray-800 pb-3 justify-between">
-                            <h3 class="text-lg font-semibold flex items-center gap-2 text-rose-400">
-                                <span class="p-1.5 bg-rose-500/10 text-rose-400 rounded-lg">
-                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>
-                                </span>
-                                Intercepted Live Streams (.m3u8 / .mpd)
-                            </h3>
-                            <span class="text-xs font-semibold px-2.5 py-1 bg-rose-500/10 text-rose-300 rounded-full animate-pulse">LJ Sniffer Active</span>
-                        </div>
-                        
-                        <p class="text-xs text-gray-400 mb-4 leading-relaxed">
-                            These streams were captured directly from the simulated network card of the native browser frame. All required authentication headers, Referer, User-Agent, and Cookies have been automatically harvested!
-                        </p>
-
-                        <div class="space-y-4" id="sniffedStreamsList">
-                            <!-- Sniffed items populated here -->
                         </div>
                     </div>
                 </div>
@@ -814,25 +798,15 @@ HTML_TEMPLATE = r"""
     </div>
 
     <script>
-        const tabLiveBtn = document.getElementById('tabLiveBtn');
         const tabSnifferBtn = document.getElementById('tabSnifferBtn');
         const tabDirectBtn = document.getElementById('tabDirectBtn');
-        
-        const liveSnifferForm = document.getElementById('liveSnifferForm');
         const extractForm = document.getElementById('extractForm');
         const directStreamForm = document.getElementById('directStreamForm');
-
-        const liveSniffUrl = document.getElementById('liveSniffUrl');
-        const liveSniffBtn = document.getElementById('liveSniffBtn');
-        const liveSniffBtnText = document.getElementById('liveSniffBtnText');
-        const liveSniffSpinner = document.getElementById('liveSniffSpinner');
-        
-        const sniffedResultPanel = document.getElementById('sniffedResultPanel');
-        const sniffedStreamsList = document.getElementById('sniffedStreamsList');
 
         const cookieSourceSelect = document.getElementById('cookieSource');
         const browserSection = document.getElementById('browserSection');
         const filePathSection = document.getElementById('filePathSection');
+        const playwrightSection = document.getElementById('playwrightSection');
         const submitBtn = document.getElementById('submitBtn');
         const spinner = document.getElementById('spinner');
         const btnText = document.getElementById('btnText');
@@ -857,28 +831,12 @@ HTML_TEMPLATE = r"""
         const cookieStatus = document.getElementById('cookieStatus');
 
         // Tab selection logic
-        tabLiveBtn.addEventListener('click', () => {
-            tabLiveBtn.classList.add('text-rose-400', 'border-rose-500');
-            tabLiveBtn.classList.remove('text-gray-400', 'border-transparent');
-            tabSnifferBtn.classList.add('text-gray-400', 'border-transparent');
-            tabSnifferBtn.classList.remove('text-blue-400', 'border-blue-500');
-            tabDirectBtn.classList.add('text-gray-400', 'border-transparent');
-            tabDirectBtn.classList.remove('text-emerald-400', 'border-emerald-500');
-            
-            liveSnifferForm.classList.remove('hidden');
-            extractForm.classList.add('hidden');
-            directStreamForm.classList.add('hidden');
-        });
-
         tabSnifferBtn.addEventListener('click', () => {
             tabSnifferBtn.classList.add('text-blue-400', 'border-blue-500');
             tabSnifferBtn.classList.remove('text-gray-400', 'border-transparent');
-            tabLiveBtn.classList.add('text-gray-400', 'border-transparent');
-            tabLiveBtn.classList.remove('text-rose-400', 'border-rose-500');
             tabDirectBtn.classList.add('text-gray-400', 'border-transparent');
             tabDirectBtn.classList.remove('text-emerald-400', 'border-emerald-500');
             
-            liveSnifferForm.classList.add('hidden');
             extractForm.classList.remove('hidden');
             directStreamForm.classList.add('hidden');
         });
@@ -886,12 +844,9 @@ HTML_TEMPLATE = r"""
         tabDirectBtn.addEventListener('click', () => {
             tabDirectBtn.classList.add('text-emerald-400', 'border-emerald-500');
             tabDirectBtn.classList.remove('text-gray-400', 'border-transparent');
-            tabLiveBtn.classList.add('text-gray-400', 'border-transparent');
-            tabLiveBtn.classList.remove('text-rose-400', 'border-rose-500');
             tabSnifferBtn.classList.add('text-gray-400', 'border-transparent');
             tabSnifferBtn.classList.remove('text-blue-400', 'border-blue-500');
             
-            liveSnifferForm.classList.add('hidden');
             extractForm.classList.add('hidden');
             directStreamForm.classList.remove('hidden');
         });
@@ -902,25 +857,27 @@ HTML_TEMPLATE = r"""
             if (val === 'browser') {
                 browserSection.classList.remove('hidden');
                 filePathSection.classList.add('hidden');
+                playwrightSection.classList.add('hidden');
             } else if (val === 'file') {
                 browserSection.classList.add('hidden');
                 filePathSection.classList.remove('hidden');
+                playwrightSection.classList.add('hidden');
+            } else if (val === 'playwright_auto') {
+                browserSection.classList.add('hidden');
+                filePathSection.classList.add('hidden');
+                playwrightSection.classList.remove('hidden');
             } else {
                 browserSection.classList.add('hidden');
                 filePathSection.classList.add('hidden');
+                playwrightSection.classList.add('hidden');
             }
         });
 
         // Initialize state
-        if (cookieSourceSelect.value === 'browser') {
-            browserSection.classList.remove('hidden');
-            filePathSection.classList.add('hidden');
-        } else if (cookieSourceSelect.value === 'file') {
-            browserSection.classList.add('hidden');
-            filePathSection.classList.remove('hidden');
+        if (cookieSourceSelect.value === 'playwright_auto') {
+            playwrightSection.classList.remove('hidden');
         } else {
-            browserSection.classList.add('hidden');
-            filePathSection.classList.add('hidden');
+            playwrightSection.classList.add('hidden');
         }
 
         // Parse format seconds
@@ -931,97 +888,6 @@ HTML_TEMPLATE = r"""
             const s = Math.floor(sec % 60);
             return h > 0 ? `${h}h ${m}m ${s}s` : `${m}m ${s}s`;
         }
-
-        // Handle Live Webview Interception Form Submit
-        liveSnifferForm.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
-            // Set loading state
-            liveSniffBtn.disabled = true;
-            liveSniffSpinner.classList.remove('hidden');
-            liveSniffBtnText.textContent = "Intercepting Live Network Traffic...";
-            
-            errorPanel.classList.add('hidden');
-            resultPanel.classList.add('hidden');
-            sniffedResultPanel.classList.add('hidden');
-            placeholderPanel.classList.remove('hidden');
-
-            const payload = {
-                url: liveSniffUrl.value.trim()
-            };
-
-            try {
-                const response = await fetch('/api/sniff', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                const data = await response.json();
-
-                if (data.error) {
-                    errorText.textContent = data.error;
-                    errorPanel.classList.remove('hidden');
-                    placeholderPanel.classList.add('hidden');
-                } else if (!data.streams || data.streams.length === 0) {
-                    errorText.textContent = "Sniffing Completed: No active adaptive streams (.m3u8 or .mpd) were intercepted. Please verify if the URL contains media contents and contains video elements.";
-                    errorPanel.classList.remove('hidden');
-                    placeholderPanel.classList.add('hidden');
-                } else {
-                    // Populate Sniffed Result UI
-                    sniffedStreamsList.innerHTML = '';
-                    
-                    data.streams.forEach((stream, index) => {
-                        const card = document.createElement('div');
-                        card.className = "bg-gray-950 border border-gray-800 rounded-xl p-4 space-y-3 hover:border-rose-900/40 transition";
-                        
-                        const encodedHeaders = btoa(unescape(encodeURIComponent(JSON.stringify(stream.headers || {}))));
-                        const streamName = `Sniffed_Stream_${index + 1}`;
-                        const encodedTitle = encodeURIComponent(streamName);
-                        const formatId = `sniffed-hls-${index + 1}`;
-                        
-                        card.innerHTML = `
-                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
-                                <div>
-                                    <span class="px-2 py-0.5 bg-rose-500/10 text-rose-400 text-[10px] font-bold rounded uppercase tracking-wider">
-                                        ${stream.type}
-                                    </span>
-                                    <h4 class="text-sm font-semibold text-gray-200 mt-1 break-all select-all mono text-xs">
-                                        ${stream.url}
-                                    </h4>
-                                </div>
-                                <div class="flex items-center gap-2 flex-shrink-0">
-                                    <button onclick="downloadFormat('${formatId}', '${formatId}', '${stream.url}', '${encodedHeaders}', '${encodedTitle}')" 
-                                            class="px-3 py-1.5 bg-gradient-to-r from-rose-600 to-pink-600 text-white rounded-lg hover:from-rose-500 hover:to-pink-500 transition active:scale-95 text-xs font-semibold flex items-center gap-1">
-                                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                                        Download
-                                    </button>
-                                    <button onclick="copyToClipboard('${stream.url}')" 
-                                            class="px-2.5 py-1.5 bg-gray-900 border border-gray-800 text-gray-300 rounded-lg hover:bg-gray-800 transition active:scale-95 text-xs font-medium">
-                                        Copy URL
-                                    </button>
-                                </div>
-                            </div>
-                            <div class="pt-2 border-t border-gray-800/60 flex flex-wrap gap-2 text-[10px] text-gray-500">
-                                <span class="bg-gray-900 px-2 py-0.5 rounded font-mono">User-Agent: Simulated Native Client</span>
-                                <span class="bg-gray-900 px-2 py-0.5 rounded font-mono">Automatic Cookie Extraction: Active</span>
-                            </div>
-                        `;
-                        sniffedStreamsList.appendChild(card);
-                    });
-                    
-                    placeholderPanel.classList.add('hidden');
-                    sniffedResultPanel.classList.remove('hidden');
-                }
-            } catch (err) {
-                errorText.textContent = `Interception Request Error: ${err.message}`;
-                errorPanel.classList.remove('hidden');
-                placeholderPanel.classList.add('hidden');
-            } finally {
-                liveSniffBtn.disabled = false;
-                liveSniffSpinner.classList.add('hidden');
-                liveSniffBtnText.textContent = "Start Interception Sniffing";
-            }
-        });
 
         // Handle Metadata Extraction Form Submit
         extractForm.addEventListener('submit', async (e) => {
@@ -1041,7 +907,8 @@ HTML_TEMPLATE = r"""
                 cookie_source: cookieSourceSelect.value,
                 custom_file_path: document.getElementById('cookieFilePath').value,
                 pasted_cookie_content: pastedCookies.value,
-                browser_name: document.getElementById('browserName').value
+                browser_name: document.getElementById('browserName').value,
+                playwright_headless: document.getElementById('playwrightHeadless').checked
             };
 
             try {
@@ -1082,10 +949,9 @@ HTML_TEMPLATE = r"""
                             tr.className = "hover:bg-gray-800/20 transition";
                             
                             const encodedHeaders = btoa(unescape(encodeURIComponent(JSON.stringify(fmt.Headers || {}))));
-                            const encodedTitle = encodeURIComponent(data.Title || "Stream_Video");
                             
                             let actionHtml = `
-                                <button onclick="downloadFormat('${data.Content_ID}', '${fmt.Format_ID}', '${fmt.Stream_Manifest_URL}', '${encodedHeaders}', '${encodedTitle}')" class="px-2.5 py-1 bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded hover:from-blue-500 hover:to-indigo-500 transition active:scale-95 text-[11px] font-semibold flex items-center gap-1" title="Download segment streams directly with active cookie state">
+                                <button onclick="downloadFormat('${data.Content_ID}', '${fmt.Format_ID}', '${fmt.Stream_Manifest_URL}', '${encodedHeaders}')" class="px-2.5 py-1 bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded hover:from-blue-500 hover:to-indigo-500 transition active:scale-95 text-[11px] font-semibold flex items-center gap-1" title="Download segment streams directly with active cookie state">
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
                                     Download
                                 </button>
@@ -1139,7 +1005,6 @@ HTML_TEMPLATE = r"""
             e.preventDefault();
             
             const directUrl = document.getElementById('directStreamUrl').value.trim();
-            const directTitle = document.getElementById('directTitle').value.trim() || "Custom_LJ_Download";
             const rawHeaders = document.getElementById('directHeaders').value.trim();
             const cookieSrc = document.getElementById('directCookieSource').value;
             
@@ -1161,7 +1026,6 @@ HTML_TEMPLATE = r"""
             
             const payload = {
                 url: directUrl,
-                title: directTitle,
                 headers: headers,
                 cookie_source: cookieSrc,
                 pasted_cookie_content: pastedCookies.value,
@@ -1193,7 +1057,7 @@ HTML_TEMPLATE = r"""
         });
 
         // Trigger format download
-        async function downloadFormat(contentId, formatId, manifestUrl, base64Headers, encodedTitle) {
+        async function downloadFormat(contentId, formatId, manifestUrl, base64Headers) {
             let headers = {};
             if (base64Headers) {
                 try {
@@ -1203,18 +1067,8 @@ HTML_TEMPLATE = r"""
                 }
             }
             
-            let title = "Stream Download";
-            if (encodedTitle) {
-                try {
-                    title = decodeURIComponent(encodedTitle);
-                } catch (e) {
-                    console.error("Failed to decode title", e);
-                }
-            }
-            
             const payload = {
                 url: manifestUrl,
-                title: title,
                 format_id: formatId,
                 headers: headers,
                 cookie_source: cookieSourceSelect.value,
@@ -1249,35 +1103,6 @@ HTML_TEMPLATE = r"""
 
         // --- BACKGROUND DOWNLOAD DASHBOARD & POLLING ---
         let pollingInterval = null;
-
-        function renderSegmentGrid(pct, idx, count) {
-            const totalBlocks = 36; // A compact, beautiful 36-block grid (12 columns x 3 rows)
-            let html = '<div class="grid grid-cols-12 gap-1 w-full mt-2.5 p-2 bg-black/40 rounded-xl border border-gray-800/40">';
-            
-            let completedBlocks = 0;
-            if (count && count > 0) {
-                completedBlocks = Math.floor((idx / count) * totalBlocks);
-            } else if (pct >= 0) {
-                completedBlocks = Math.floor((pct / 100) * totalBlocks);
-            }
-            
-            for (let i = 0; i < totalBlocks; i++) {
-                let bgClass = "bg-gray-800/60";
-                let titleText = `Segment block ${i+1}`;
-                
-                if (i < completedBlocks) {
-                    bgClass = "bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.4)]";
-                    titleText = "Completed segment";
-                } else if (i === completedBlocks && pct > 0 && pct < 100) {
-                    bgClass = "bg-blue-500 animate-pulse shadow-[0_0_4px_rgba(59,130,246,0.5)]";
-                    titleText = "Downloading segments...";
-                }
-                
-                html += `<div class="h-2 rounded-sm ${bgClass} transition-all duration-300" title="${titleText}"></div>`;
-            }
-            html += '</div>';
-            return html;
-        }
 
         function renderTransfers(transfers) {
             const listContainer = document.getElementById('transfersList');
@@ -1351,28 +1176,15 @@ HTML_TEMPLATE = r"""
                 if (dl.status === "failed") {
                     subtitleLine = `<span class="text-red-400 text-[11px] truncate block max-w-sm mono mt-1">${dl.error}</span>`;
                 } else if (dl.status === "downloading") {
-                    let segmentsText = "";
-                    if (dl.fragment_count > 0) {
-                        segmentsText = `<span class="bg-gray-850 px-2 py-0.5 rounded text-[10px] text-gray-400 font-medium">Segments: ${dl.fragment_index} / ${dl.fragment_count}</span>`;
-                    } else if (dl.fragment_index > 0) {
-                        segmentsText = `<span class="bg-gray-850 px-2 py-0.5 rounded text-[10px] text-gray-400 font-medium">Segments: ${dl.fragment_index}</span>`;
-                    }
-                    
                     subtitleLine = `
-                        <div class="flex flex-wrap items-center gap-2 text-[11px] text-gray-500 mt-1.5">
+                        <div class="flex items-center gap-2.5 text-[11px] text-gray-500 mt-1">
                             <span>Speed: <strong class="text-gray-300 mono">${dl.speed}</strong></span>
                             <span>ETA: <strong class="text-gray-300 mono">${dl.eta}</strong></span>
                             <span>Size: <strong class="text-gray-300 mono">${dl.size}</strong></span>
-                            ${segmentsText}
                         </div>
                     `;
                 } else {
                     subtitleLine = `<span class="text-gray-500 text-[11px] truncate block max-w-sm mt-1">${dl.filename || 'Initializing stream pipeline...'}</span>`;
-                }
-                
-                let gridHtml = "";
-                if (dl.status === "downloading") {
-                    gridHtml = renderSegmentGrid(pct, dl.fragment_index, dl.fragment_count);
                 }
                 
                 html += `
@@ -1399,7 +1211,6 @@ HTML_TEMPLATE = r"""
                                 <div class="${barColor} h-1 rounded-full transition-all duration-300" style="${widthStyle}"></div>
                             </div>
                         </div>
-                        ${gridHtml}
                     </div>
                 `;
             });
@@ -1563,6 +1374,7 @@ def api_fetch():
     custom_file_path = data.get('custom_file_path')
     pasted_cookie_content = data.get('pasted_cookie_content')
     browser_name = data.get('browser_name', 'chrome')
+    playwright_headless = data.get('playwright_headless', True)
 
     if not url:
         return jsonify({"error": "Target video URL is required."}), 400
@@ -1572,18 +1384,9 @@ def api_fetch():
         cookie_source=cookie_source,
         custom_file_path=custom_file_path,
         pasted_cookie_content=pasted_cookie_content,
-        browser_name=browser_name
+        browser_name=browser_name,
+        playwright_headless=playwright_headless
     )
-    return jsonify(result)
-
-@app.route('/api/sniff', methods=['POST'])
-def api_sniff():
-    data = request.get_json() or {}
-    url = data.get('url')
-    if not url:
-        return jsonify({"error": "Target video URL is required."}), 400
-
-    result = sniff_webpage_streams(url)
     return jsonify(result)
 
 @app.route('/api/save_cookies', methods=['POST'])
@@ -1610,7 +1413,6 @@ def api_save_cookies():
 def api_download_trigger():
     data = request.get_json() or {}
     url = data.get('url')
-    title = data.get('title')
     headers = data.get('headers')
     format_id = data.get('format_id')
     cookie_source = data.get('cookie_source', 'pasted')
@@ -1627,7 +1429,6 @@ def api_download_trigger():
         target=download_task_thread,
         args=(download_id, url),
         kwargs={
-            "title": title,
             "headers": headers,
             "format_id": format_id,
             "cookie_source": cookie_source,
@@ -1687,7 +1488,7 @@ def api_serve_file(filename):
 
 if __name__ == "__main__":
     # Standard development server on port 3000 to match AI Studio mapping
-    port = int(os.environ.get("PORT", 15000))
+    port = int(os.environ.get("PORT", 23000))
     print(f"\n[SERVER RUNNING] Starting Flask application on http://0.0.0.0:{port}")
     print(f"Working local cookies.txt target path: {DEFAULT_WORKSPACE_COOKIE_PATH}\n")
     app.run(host="0.0.0.0", port=port, debug=True)
